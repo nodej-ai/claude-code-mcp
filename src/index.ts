@@ -9,14 +9,39 @@
  * Transport: stdio (registered in claude_desktop_config.json)
  */
 
+// Safety guard: in a stdio MCP server, process.stdout is the JSON-RPC channel.
+// Any console.log (from this code or any dependency) will corrupt the stream.
+// Redirect all console variants to stderr so they appear in logs without breaking the transport.
+console.log = console.error.bind(console);
+console.info = console.error.bind(console);
+console.debug = console.error.bind(console);
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { spawn, ChildProcess } from "child_process";
-import { readFileSync, readdirSync, statSync } from "fs";
+import { readFileSync, readdirSync, statSync, existsSync } from "fs";
 import { join, resolve } from "path";
 import { homedir } from "os";
 import { randomUUID } from "crypto";
 import { z } from "zod";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { config as dotenvConfig } from "dotenv";
+
+// Load dispatcher credentials so bridge can write to dispatcher_jobs
+// quiet: true suppresses dotenv v17's console.log output (e.g. "◇ injected env …").
+// In a stdio MCP server, stdout is the JSON-RPC transport channel — any non-JSON
+// written there (including dotenv's startup log) corrupts the MCP handshake.
+dotenvConfig({
+  path: resolve(homedir(), "Projects/julian-nodejeos/packages/engineering-dispatcher/.env"),
+  quiet: true,
+});
+
+const supabase: SupabaseClient | null = (() => {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return null;
+  return createClient(url, key);
+})();
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -24,6 +49,7 @@ type JobStatus = "running" | "completed" | "failed" | "cancelled";
 
 interface Job {
   id: string;
+  taskId?: string;
   project: string;
   task: string;
   contextFile?: string;
@@ -66,11 +92,27 @@ function resolveProjectPath(project: string): string {
       `Invalid project name: "${project}". Use alphanumeric characters, hyphens, underscores, or spaces.`
     );
   }
-  const projectPath = resolve(PROJECTS_DIR, project);
-  if (!projectPath.startsWith(PROJECTS_DIR)) {
-    throw new Error(`Project path escapes Projects directory.`);
+
+  const check = (p: string): string | null => {
+    if (!p.startsWith(PROJECTS_DIR)) return null;
+    return existsSync(p) ? p : null;
+  };
+
+  // 1. Flat: ~/Projects/{project}
+  const flat = resolve(PROJECTS_DIR, project);
+  if (check(flat)) return flat;
+
+  // 2. One level deep: ~/Projects/*/{project}
+  const entries = readdirSync(PROJECTS_DIR, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = resolve(PROJECTS_DIR, entry.name, project);
+    if (check(candidate)) return candidate;
   }
-  return projectPath;
+
+  throw new Error(
+    `Project not found: ${project} (checked ~/Projects/${project} and one level deep)`
+  );
 }
 
 function formatJob(job: Job): string {
@@ -136,6 +178,11 @@ Error cases:
           .string()
           .optional()
           .describe("Absolute path to a handoff file to prepend as context"),
+        task_id: z
+          .string()
+          .uuid()
+          .optional()
+          .describe("UUID from memory.tasks — used to link dispatcher_jobs rows"),
       })
       .strict(),
     annotations: {
@@ -145,7 +192,7 @@ Error cases:
       openWorldHint: true,
     },
   },
-  async ({ project, task, context_file }) => {
+  async ({ project, task, context_file, task_id }) => {
     purgeOldJobs();
 
     let projectPath: string;
@@ -208,6 +255,7 @@ Error cases:
     const jobId = randomUUID();
     const job: Job = {
       id: jobId,
+      taskId: task_id,
       project,
       task,
       contextFile: context_file,
@@ -217,14 +265,33 @@ Error cases:
     };
     jobs.set(jobId, job);
 
+    if (supabase && task_id) {
+      supabase.schema("memory").from("dispatcher_jobs").insert({
+        job_id: jobId,
+        task_id,
+        project,
+        status: "running",
+        started_at: new Date().toISOString(),
+      }).then(({ error }) => {
+        if (error) console.error("[bridge] dispatcher_jobs insert error:", error.message);
+      });
+    }
+
     // Spawn Claude Code
+    // Use --output-format stream-json to suppress TUI decorations (◇ injected, spinners, etc.)
+    // that would otherwise appear in text mode and corrupt the MCP stdio transport.
+    // stream-json emits one JSON object per line; we extract the text from assistant turns.
     let child: ChildProcess;
     try {
-      child = spawn("claude", ["--dangerously-skip-permissions", "--print", fullPrompt], {
-        cwd: projectPath,
-        env: { ...process.env },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      child = spawn(
+        "claude",
+        ["--dangerously-skip-permissions", "--print", "--output-format", "stream-json", fullPrompt],
+        {
+          cwd: projectPath,
+          env: { ...process.env },
+          stdio: ["ignore", "pipe", "pipe"],
+        }
+      );
     } catch {
       job.status = "failed";
       job.output = "Error: Failed to spawn claude process. Is Claude Code CLI installed and on PATH?";
@@ -243,9 +310,41 @@ Error cases:
     job.pid = child.pid;
     processes.set(jobId, child);
 
-    // Stream stdout to buffer
+    // stream-json emits one JSON object per line. Extract text from assistant message chunks;
+    // fall back to appending the raw line for any line that isn't parseable JSON (shouldn't happen,
+    // but keeps output readable if the format ever changes).
+    let stdoutBuf = "";
     child.stdout?.on("data", (chunk: Buffer) => {
-      job.output += chunk.toString("utf-8");
+      stdoutBuf += chunk.toString("utf-8");
+      const lines = stdoutBuf.split("\n");
+      stdoutBuf = lines.pop() ?? ""; // keep incomplete last line in buffer
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const event = JSON.parse(trimmed) as Record<string, unknown>;
+          // stream-json events have a "type" field. Pull text from assistant content blocks.
+          if (
+            event.type === "assistant" &&
+            event.message &&
+            typeof event.message === "object"
+          ) {
+            const msg = event.message as { content?: unknown[] };
+            for (const block of msg.content ?? []) {
+              const b = block as { type?: string; text?: string };
+              if (b.type === "text" && typeof b.text === "string") {
+                job.output += b.text;
+              }
+            }
+          } else if (event.type === "result" && typeof (event as Record<string, unknown>).result === "string") {
+            // Final result event — append if not already captured via content blocks
+          }
+          // Ignore other event types (tool_use, tool_result, system, etc.)
+        } catch {
+          // Not JSON — append raw so nothing is silently lost
+          job.output += line + "\n";
+        }
+      }
     });
 
     // Stream stderr to buffer (prefixed so it's distinguishable)
@@ -258,6 +357,17 @@ Error cases:
       job.exitCode = code ?? undefined;
       job.completedAt = new Date().toISOString();
       processes.delete(jobId);
+
+      if (supabase) {
+        supabase.schema("memory").from("dispatcher_jobs").update({
+          status: job.status,
+          output: job.output.slice(0, 10000),
+          exit_code: code ?? null,
+          completed_at: job.completedAt,
+        }).eq("job_id", jobId).then(({ error }) => {
+          if (error) console.error("[bridge] dispatcher_jobs update error:", error.message);
+        });
+      }
     });
 
     child.on("error", (err: Error) => {
@@ -564,6 +674,24 @@ Returns a list of directory names.`,
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  if (supabase) {
+    const { data: staleJobs } = await supabase
+      .schema("memory")
+      .from("dispatcher_jobs")
+      .select("job_id")
+      .eq("status", "running");
+    for (const j of staleJobs ?? []) {
+      await supabase.schema("memory").from("dispatcher_jobs").update({
+        status: "failed",
+        output: "Bridge restarted — job lost. Dispatcher will requeue.",
+        completed_at: new Date().toISOString(),
+      }).eq("job_id", j.job_id);
+    }
+    if ((staleJobs?.length ?? 0) > 0) {
+      console.error(`[bridge] Marked ${staleJobs!.length} stale running job(s) as failed on startup`);
+    }
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[claude-code-mcp] Server running via stdio");
