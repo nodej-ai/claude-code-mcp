@@ -10,3 +10,7 @@
 [2026-05-27 10:17:42] SESSION START — claude-code-mcp (session: 348733a6)
 [2026-05-27T17:17:42Z] SESSION_START: dual memory retrieval ready (Supabase + MCP knowledge graph)
 [2026-05-27T17:17:42Z] HINT: to unstick a task: bash ~/Projects/julian-nodejeos/scripts/task-fix.sh <task_id> <status>
+[2026-05-27 10:17:48] TOOL: ToolSearch — {"matches": [], "query": "select:mcp__8d3fa5e2-49bc-421c-b89e-ee842dfb891b__execute_sql", "total_deferred_tools": 56}
+[2026-05-27 10:17:53] TOOL: ToolSearch — {"matches": ["mcp__plugin_supabase_supabase__authenticate", "mcp__plugin_supabase_supabase__complete_authentication"], "
+[2026-05-27 10:17:55] TOOL: ToolSearch — {"matches": ["CronDelete", "EnterPlanMode", "EnterWorktree", "ExitWorktree"], "query": "execute_sql memory", "total_defe
+[2026-05-27 10:18:02] TOOL: ToolSearch — {"matches": ["TodoWrite"], "query": "select:TodoWrite", "total_deferred_tools": 56}
