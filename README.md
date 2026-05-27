@@ -7,7 +7,7 @@ Local MCP bridge that lets Cowork run Claude Code tasks programmatically. Write 
 **Prerequisites:** Node.js 18+, Claude Code CLI
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/juliantang/claude-code-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nodej-ai/claude-code-mcp/main/install.sh | bash
 ```
 
 Then restart Cowork.

@@ -2,13 +2,13 @@
 # ============================================================
 # claude-code-mcp — installer
 # Clones the repo, builds, and registers the MCP bridge.
-# Usage: curl -fsSL https://raw.githubusercontent.com/juliantang/claude-code-mcp/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/nodej-ai/claude-code-mcp/main/install.sh | bash
 # ============================================================
 
 set -e
 
 INSTALL_DIR="$HOME/Projects/claude-code-mcp"
-REPO_URL="https://github.com/juliantang/claude-code-mcp.git"
+REPO_URL="https://github.com/nodej-ai/claude-code-mcp.git"
 CONFIG_FILE="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 
 echo ""
