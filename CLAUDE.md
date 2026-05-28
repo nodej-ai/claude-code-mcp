@@ -49,6 +49,11 @@ npm run lint        # eslint src/
 }
 ```
 
+## Distribution
+**Decision (2026-05-28):** Keep as standalone shareable repo. No hard NodeJ dependencies — Supabase integration is opt-in via env vars. Anyone with Claude Desktop + Claude Code can install and use it independently.
+
+**Future:** When packaging the full NodeJ stack for distribution, include a bundled copy (with Supabase wired up) as part of the managed product. Not a migration — a separate inclusion.
+
 ## Cowork vs Claude Code
 - **Cowork** writes specs, dispatches tasks, polls status
 - **Claude Code** implements features, commits, pushes
