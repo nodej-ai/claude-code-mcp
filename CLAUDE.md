@@ -54,6 +54,13 @@ npm run lint        # eslint src/
 
 **Future:** When packaging the full NodeJ stack for distribution, include a bundled copy (with Supabase wired up) as part of the managed product. Not a migration — a separate inclusion.
 
+## Pending Work
+
+Handoff for Claude Code (runtime hardening, round 2):
+`cowork/handoffs/bridge-runtime-improvements-handoff-2026-05-27.md`
+
+Items: F5 (output cap 512KB), F7 (SIGKILL escalation), F10 (concurrent job limit MAX_CONCURRENT_JOBS=3), F20 (output_offset polling), F21 (task timeout 30min), F1 (ESLint), F2 (typecheck script), F13 (@types/node pin to v22).
+
 ## Cowork vs Claude Code
 - **Cowork** writes specs, dispatches tasks, polls status
 - **Claude Code** implements features, commits, pushes
