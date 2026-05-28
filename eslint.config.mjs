@@ -1,0 +1,24 @@
+import tsParser from "@typescript-eslint/parser";
+import tsPlugin from "@typescript-eslint/eslint-plugin";
+
+export default [
+  {
+    files: ["src/**/*.ts"],
+    languageOptions: {
+      parser: tsParser,
+      parserOptions: {
+        project: "./tsconfig.json",
+      },
+    },
+    plugins: {
+      "@typescript-eslint": tsPlugin,
+    },
+    rules: {
+      ...tsPlugin.configs.recommended.rules,
+      // Allow explicit any where intentional (e.g., JSON parse results)
+      "@typescript-eslint/no-explicit-any": "warn",
+      // Unused vars are errors — catch dead code
+      "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
+    },
+  },
+];

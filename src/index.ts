@@ -22,19 +22,43 @@ import { spawn, ChildProcess } from "child_process";
 import { readFileSync, readdirSync, statSync, existsSync } from "fs";
 import { join, resolve } from "path";
 import { homedir } from "os";
+import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
 import { z } from "zod";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { config as dotenvConfig } from "dotenv";
 
-// Load dispatcher credentials so bridge can write to dispatcher_jobs
+// Load dispatcher credentials so bridge can write to dispatcher_jobs.
 // quiet: true suppresses dotenv v17's console.log output (e.g. "◇ injected env …").
 // In a stdio MCP server, stdout is the JSON-RPC transport channel — any non-JSON
 // written there (including dotenv's startup log) corrupts the MCP handshake.
-dotenvConfig({
-  path: resolve(homedir(), "Projects/julian-nodejeos/packages/engineering-dispatcher/.env"),
-  quiet: true,
-});
+//
+// .env resolution order (F18 — configurable for distribution):
+//   1. CLAUDE_CODE_MCP_ENV env var  — recommended for CI / multi-machine installs
+//   2. .env next to the package root — drop-in for new installs (create alongside package.json)
+//   3. Legacy path on Julian's machine — backward-compat fallback, will log a warning
+//
+// For distribution: set CLAUDE_CODE_MCP_ENV=/absolute/path/to/.env in the shell that
+// launches the MCP server, or create a .env in the claude-code-mcp root directory.
+const SERVER_ROOT = resolve(fileURLToPath(import.meta.url), "../..");
+const pkg = JSON.parse(readFileSync(join(SERVER_ROOT, "package.json"), "utf-8")) as { version?: string };
+const SERVER_VERSION = pkg.version ?? "1.0.0";
+const envCandidates = [
+  process.env.CLAUDE_CODE_MCP_ENV,
+  join(SERVER_ROOT, ".env"),
+  resolve(homedir(), "Projects/julian-nodejeos/packages/engineering-dispatcher/.env"),
+].filter(Boolean) as string[];
+
+const resolvedEnvPath = envCandidates.find(existsSync);
+if (resolvedEnvPath) {
+  dotenvConfig({ path: resolvedEnvPath, quiet: true });
+} else {
+  console.error(
+    "[claude-code-mcp] No .env found — Supabase integration disabled. " +
+    "Set CLAUDE_CODE_MCP_ENV=/path/to/.env or create a .env in the package root. " +
+    "See README.md for setup instructions."
+  );
+}
 
 const supabase: SupabaseClient | null = (() => {
   const url = process.env.SUPABASE_URL;
@@ -65,7 +89,11 @@ interface Job {
 
 const jobs = new Map<string, Job>();
 const processes = new Map<string, ChildProcess>();
+const timeouts = new Map<string, ReturnType<typeof setTimeout>>();
 const JOB_TTL_MS = 24 * 60 * 60 * 1000; // purge jobs after 24h
+const MAX_CONCURRENT_JOBS = 3; // F10: cap simultaneous Claude Code subprocesses
+const OUTPUT_CAP = 512 * 1024; // F5: 512KB in-memory output ceiling
+const TASK_TIMEOUT_MS = 30 * 60 * 1000; // F21: 30-minute hard timeout per task
 
 function purgeOldJobs(): void {
   const cutoff = Date.now() - JOB_TTL_MS;
@@ -76,6 +104,7 @@ function purgeOldJobs(): void {
     ) {
       jobs.delete(id);
       processes.delete(id);
+      timeouts.delete(id); // defensive: all exit paths clear this, but purge should too
     }
   }
 }
@@ -133,7 +162,7 @@ function formatJob(job: Job): string {
 
 const server = new McpServer({
   name: "claude-code-mcp-server",
-  version: "1.0.0",
+  version: SERVER_VERSION,
 });
 
 // ── Tool 1: run a Claude Code task ────────────────────────────────────────────
@@ -160,10 +189,15 @@ Examples:
   - Run a task: project="forkcast", task="Add the missing bankroll_transactions indexes from the schema handoff"
   - With context: project="forkcast", task="Implement phase 2", context_file="/Users/juliantang/Projects/forkcast/cowork/handoffs/phase2-handoff-2026-05-12.md"
 
+Limits:
+  - Tasks are killed after 30 minutes with status "failed"
+  - Max 3 concurrent running tasks
+
 Error cases:
   - "Project not found" if ~/Projects/{project} doesn't exist
   - "Invalid project name" if name contains unsafe characters
-  - "claude binary not found" if Claude Code CLI isn't installed`,
+  - "Failed to start Claude Code process" if spawn options are invalid (missing binary surfaces as a failed job via the process error event)
+  - "concurrent job limit reached" if 3 tasks are already running`,
     inputSchema: z
       .object({
         project: z
@@ -195,6 +229,15 @@ Error cases:
   async ({ project, task, context_file, task_id }) => {
     purgeOldJobs();
 
+    // F10: reject if concurrent running job limit is reached
+    const runningCount = [...jobs.values()].filter(j => j.status === "running").length;
+    if (runningCount >= MAX_CONCURRENT_JOBS) {
+      return {
+        content: [{ type: "text", text: `Error: concurrent job limit (${MAX_CONCURRENT_JOBS}) reached. Wait for a running job to finish or cancel one.` }],
+        isError: true,
+      };
+    }
+
     let projectPath: string;
     try {
       projectPath = resolveProjectPath(project);
@@ -210,24 +253,13 @@ Error cases:
       };
     }
 
-    // Verify project directory exists
-    try {
-      const stat = statSync(projectPath);
-      if (!stat.isDirectory()) {
-        return {
-          content: [
-            { type: "text", text: `Error: "${projectPath}" exists but is not a directory.` },
-          ],
-          isError: true,
-        };
-      }
-    } catch {
+    // resolveProjectPath already verified the path exists via existsSync.
+    // statSync here is purely to catch the edge case where a matching path
+    // exists but is a file rather than a directory (e.g. ~/Projects/forkcast is a file).
+    if (!statSync(projectPath).isDirectory()) {
       return {
         content: [
-          {
-            type: "text",
-            text: `Error: Project not found at ${projectPath}. Run claude_list_projects to see available projects.`,
-          },
+          { type: "text", text: `Error: "${projectPath}" exists but is not a directory.` },
         ],
         isError: true,
       };
@@ -271,36 +303,49 @@ Error cases:
         task_id,
         project,
         status: "running",
-        started_at: new Date().toISOString(),
+        started_at: job.startedAt,
       }).then(({ error }) => {
         if (error) console.error("[bridge] dispatcher_jobs insert error:", error.message);
       });
     }
 
     // Spawn Claude Code
-    // Use --output-format stream-json to suppress TUI decorations (◇ injected, spinners, etc.)
-    // that would otherwise appear in text mode and corrupt the MCP stdio transport.
-    // stream-json emits one JSON object per line; we extract the text from assistant turns.
+    // --permission-mode dontAsk  — auto-approves all tool calls without interactive prompts,
+    //   but respects directory scope (unlike --dangerously-skip-permissions which bypasses
+    //   all checks including filesystem boundaries). Scoped to PROJECTS_DIR via --add-dir.
+    // --add-dir PROJECTS_DIR     — grants access to ~/Projects/ only, not the full filesystem.
+    //   Tasks that need cross-project reads (e.g. julian-nodejeos from danielle) still work
+    //   because both are under ~/Projects/.
+    // --output-format stream-json — suppresses TUI decorations that would corrupt the MCP
+    //   stdio transport. stream-json emits one JSON object per line. Requires --verbose.
     let child: ChildProcess;
     try {
       child = spawn(
         "claude",
-        ["--dangerously-skip-permissions", "--print", "--output-format", "stream-json", fullPrompt],
+        [
+          "--permission-mode", "dontAsk",
+          "--add-dir", PROJECTS_DIR,
+          "--print", "--verbose", "--output-format", "stream-json",
+          fullPrompt,
+        ],
         {
           cwd: projectPath,
           env: { ...process.env },
           stdio: ["ignore", "pipe", "pipe"],
         }
       );
-    } catch {
+    } catch (spawnErr) {
+      // spawn() throws synchronously only for invalid options (e.g., malformed env or
+      // an options object error). A missing binary does NOT throw here — it fires
+      // child.on("error") with ENOENT instead, which is handled below.
       job.status = "failed";
-      job.output = "Error: Failed to spawn claude process. Is Claude Code CLI installed and on PATH?";
+      job.output = `Error: spawn() threw synchronously: ${spawnErr instanceof Error ? spawnErr.message : String(spawnErr)}`;
       job.completedAt = new Date().toISOString();
       return {
         content: [
           {
             type: "text",
-            text: `Error: claude binary not found. Install Claude Code CLI and ensure it's on PATH.`,
+            text: `Error: Failed to start Claude Code process: ${spawnErr instanceof Error ? spawnErr.message : String(spawnErr)}`,
           },
         ],
         isError: true,
@@ -309,6 +354,22 @@ Error cases:
 
     job.pid = child.pid;
     processes.set(jobId, child);
+
+    // F21: hard 30-minute timeout — kills hung processes and frees the slot
+    const timeoutHandle = setTimeout(() => {
+      const proc = processes.get(jobId);
+      if (proc) {
+        proc.kill("SIGKILL");
+        job.status = "failed";
+        job.output += "\n[Task timed out after 30 minutes]";
+        job.completedAt = new Date().toISOString();
+        processes.delete(jobId);
+        timeouts.delete(jobId);
+        console.error(`[bridge] Task ${jobId} killed after 30-minute timeout`);
+      }
+    }, TASK_TIMEOUT_MS);
+    // Store handle so the cancel handler (a separate closure) can clear it
+    timeouts.set(jobId, timeoutHandle);
 
     // stream-json emits one JSON object per line. Extract text from assistant message chunks;
     // fall back to appending the raw line for any line that isn't parseable JSON (shouldn't happen,
@@ -333,32 +394,65 @@ Error cases:
             for (const block of msg.content ?? []) {
               const b = block as { type?: string; text?: string };
               if (b.type === "text" && typeof b.text === "string") {
-                job.output += b.text;
+                // F5: cap in-memory output at 512KB
+                if (job.output.length < OUTPUT_CAP) {
+                  job.output += b.text;
+                } else if (!job.output.endsWith("[output truncated at 512KB]")) {
+                  job.output += "\n[output truncated at 512KB]";
+                }
               }
             }
-          } else if (event.type === "result" && typeof (event as Record<string, unknown>).result === "string") {
-            // Final result event — append if not already captured via content blocks
           }
-          // Ignore other event types (tool_use, tool_result, system, etc.)
+          // Ignore other event types (result, tool_use, tool_result, system, etc.)
         } catch {
           // Not JSON — append raw so nothing is silently lost
-          job.output += line + "\n";
+          // F5: cap in-memory output at 512KB
+          if (job.output.length < OUTPUT_CAP) {
+            job.output += line + "\n";
+          } else if (!job.output.endsWith("[output truncated at 512KB]")) {
+            job.output += "\n[output truncated at 512KB]";
+          }
         }
       }
     });
 
-    // Stream stderr to buffer (prefixed so it's distinguishable)
+    // F6: flush any remaining partial line when stdout closes
+    // F5: respect OUTPUT_CAP on the final flush too
+    child.stdout?.on("end", () => {
+      if (stdoutBuf.trim()) {
+        if (job.output.length < OUTPUT_CAP) {
+          job.output += stdoutBuf;
+        } else if (!job.output.endsWith("[output truncated at 512KB]")) {
+          job.output += "\n[output truncated at 512KB]";
+        }
+        stdoutBuf = "";
+      }
+    });
+
+    // F22: prefix stderr so it's distinguishable from task output
+    // F5: cap in-memory output at 512KB
     child.stderr?.on("data", (chunk: Buffer) => {
-      job.output += chunk.toString("utf-8");
+      const stderrText = "[stderr] " + chunk.toString("utf-8");
+      if (job.output.length < OUTPUT_CAP) {
+        job.output += stderrText;
+      } else if (!job.output.endsWith("[output truncated at 512KB]")) {
+        job.output += "\n[output truncated at 512KB]";
+      }
     });
 
     child.on("close", (code: number | null) => {
+      clearTimeout(timeoutHandle); // F21: cancel the timeout on normal exit
+      timeouts.delete(jobId);
+      if (job.status === "cancelled") {
+        processes.delete(jobId); // F8 + cleanup: ensure map is cleared even on cancel
+        return;
+      }
       job.status = code === 0 ? "completed" : "failed";
       job.exitCode = code ?? undefined;
       job.completedAt = new Date().toISOString();
       processes.delete(jobId);
 
-      if (supabase) {
+      if (supabase && job.taskId) {
         supabase.schema("memory").from("dispatcher_jobs").update({
           status: job.status,
           output: job.output.slice(0, 10000),
@@ -371,6 +465,8 @@ Error cases:
     });
 
     child.on("error", (err: Error) => {
+      clearTimeout(timeoutHandle); // F21: cancel the timeout on process error
+      timeouts.delete(jobId);
       job.status = "failed";
       job.output += `\n[Process error: ${err.message}]`;
       job.completedAt = new Date().toISOString();
@@ -404,17 +500,29 @@ server.registerTool(
 Call this repeatedly (every 3-5 seconds) while status is "running" to see output as it streams in.
 Stop polling when status is "completed" or "failed".
 
+Efficient polling with output_offset: on the first call pass output_offset: 0 (or omit it). The response
+includes next_offset. On subsequent calls pass output_offset: <next_offset> and you receive only the new
+output since the last poll — avoiding retransmission of the full accumulated string.
+
 Args:
   - job_id (string): UUID returned by claude_run_task
+  - output_offset (number, optional): Byte offset into the output string. Omit or pass 0 on first call.
+    Pass the returned next_offset on subsequent calls to receive only new output.
 
 Returns:
-  - id, project, status, output (accumulated so far), startedAt, completedAt, exitCode
+  - id, project, status, output (slice from offset), next_offset, startedAt, completedAt, exitCode
 
 Error cases:
   - "Job not found" if the job_id is invalid or the job has expired (24h TTL)`,
     inputSchema: z
       .object({
         job_id: z.string().uuid("Must be a valid UUID").describe("Job ID from claude_run_task"),
+        output_offset: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Byte offset into the output string. Pass 0 (or omit) on first call, then pass the returned next_offset to receive only new output."),
       })
       .strict(),
     annotations: {
@@ -424,7 +532,7 @@ Error cases:
       openWorldHint: false,
     },
   },
-  async ({ job_id }) => {
+  async ({ job_id, output_offset }) => {
     const job = jobs.get(job_id);
     if (!job) {
       return {
@@ -438,6 +546,14 @@ Error cases:
       };
     }
 
+    // F20: return only the output slice from the requested offset so callers don't
+    // retransmit the full accumulated string on every poll.
+    // Clamp offset to output length — a stale offset from a truncated output would otherwise
+    // produce a negative slice (next_offset < offset), confusing the caller.
+    const offset = Math.min(output_offset ?? 0, job.output.length);
+    const outputSlice = job.output.slice(offset);
+    const nextOffset = job.output.length;
+
     return {
       content: [{ type: "text", text: formatJob(job) }],
       structuredContent: {
@@ -445,7 +561,8 @@ Error cases:
         project: job.project,
         task: job.task,
         status: job.status,
-        output: job.output,
+        output: outputSlice,
+        next_offset: nextOffset,
         startedAt: job.startedAt,
         completedAt: job.completedAt,
         exitCode: job.exitCode,
@@ -521,6 +638,7 @@ Returns list of jobs with id, project, status, startedAt, and task preview (firs
         count: filtered.length,
         jobs: filtered.map((j) => ({
           id: j.id,
+          task_id: j.taskId,
           project: j.project,
           status: j.status,
           startedAt: j.startedAt,
@@ -538,7 +656,7 @@ server.registerTool(
   "claude_cancel_task",
   {
     title: "Cancel Claude Code Task",
-    description: `Cancel a running Claude Code task by sending SIGTERM to the subprocess.
+    description: `Cancel a running Claude Code task. Sends SIGTERM then escalates to SIGKILL after 5 seconds if the process hasn't exited.
 
 Args:
   - job_id (string): UUID of the running job to cancel
@@ -591,11 +709,42 @@ Error cases:
     const child = processes.get(job_id);
     if (child) {
       child.kill("SIGTERM");
+      // F7: escalate to SIGKILL if the process hasn't exited within 5 seconds.
+      // Use exitCode === null rather than !child.killed: child.killed is set to true
+      // immediately after kill() is called, before the process actually exits —
+      // so !child.killed is always false here and SIGKILL would never fire.
+      setTimeout(() => {
+        if (child.exitCode === null) {
+          child.kill("SIGKILL");
+          console.error(`[bridge] SIGKILL sent to orphaned process for job ${job_id}`);
+        }
+      }, 5000);
     }
 
     job.status = "cancelled";
     job.completedAt = new Date().toISOString();
     processes.delete(job_id);
+
+    // F4: clear the 30-minute timeout — cancel already killed the process so the
+    // timeout firing against a deleted processes entry is harmless, but clearing it
+    // avoids holding the event loop open until the 30-min mark.
+    const th = timeouts.get(job_id);
+    if (th) {
+      clearTimeout(th);
+      timeouts.delete(job_id);
+    }
+
+    // Sync cancellation to Supabase so dispatcher_jobs doesn't stay "running" indefinitely.
+    // Include output so any captured progress isn't lost in the DB record.
+    if (supabase && job.taskId) {
+      supabase.schema("memory").from("dispatcher_jobs").update({
+        status: "cancelled",
+        output: job.output.slice(0, 10000),
+        completed_at: job.completedAt,
+      }).eq("job_id", job_id).then(({ error }) => {
+        if (error) console.error("[bridge] dispatcher_jobs cancel update error:", error.message);
+      });
+    }
 
     const result = {
       success: true,
@@ -674,23 +823,52 @@ Returns a list of directory names.`,
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  // F9: purge expired jobs on a regular interval, not only on task start.
+  // .unref() prevents the interval from holding the event loop open — the server
+  // exits cleanly on SIGTERM without waiting for the next purge tick.
+  setInterval(purgeOldJobs, 60 * 60 * 1000).unref();
+
+  // F11: wrap Supabase startup cleanup in its own try/catch so a Supabase outage
+  // doesn't crash the server before it starts accepting MCP connections.
   if (supabase) {
-    const { data: staleJobs } = await supabase
-      .schema("memory")
-      .from("dispatcher_jobs")
-      .select("job_id")
-      .eq("status", "running");
-    for (const j of staleJobs ?? []) {
-      await supabase.schema("memory").from("dispatcher_jobs").update({
-        status: "failed",
-        output: "Bridge restarted — job lost. Dispatcher will requeue.",
-        completed_at: new Date().toISOString(),
-      }).eq("job_id", j.job_id);
-    }
-    if ((staleJobs?.length ?? 0) > 0) {
-      console.error(`[bridge] Marked ${staleJobs!.length} stale running job(s) as failed on startup`);
+    try {
+      const { data: staleJobs } = await supabase
+        .schema("memory")
+        .from("dispatcher_jobs")
+        .select("job_id")
+        .eq("status", "running");
+      for (const j of staleJobs ?? []) {
+        await supabase.schema("memory").from("dispatcher_jobs").update({
+          status: "failed",
+          output: "Bridge restarted — job lost. Dispatcher will requeue.",
+          completed_at: new Date().toISOString(),
+        }).eq("job_id", j.job_id);
+      }
+      if ((staleJobs?.length ?? 0) > 0) {
+        console.error(`[bridge] Marked ${staleJobs!.length} stale running job(s) as failed on startup`);
+      }
+    } catch (err) {
+      console.error("[bridge] Supabase startup check failed (non-fatal — server will still start):", err);
     }
   }
+
+  // Kill all in-progress child processes when the bridge itself is terminated.
+  // Without this, Claude Code subprocesses become orphans when Cowork restarts the bridge.
+  process.on("SIGTERM", () => {
+    console.error("[bridge] SIGTERM received — killing all child processes");
+    for (const [jobId, child] of processes) {
+      child.kill("SIGKILL");
+      const job = jobs.get(jobId);
+      if (job) {
+        job.status = "failed";
+        job.output += "\n[Bridge process terminated — task killed]";
+        job.completedAt = new Date().toISOString();
+      }
+    }
+    processes.clear();
+    timeouts.clear();
+    process.exit(0);
+  });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
