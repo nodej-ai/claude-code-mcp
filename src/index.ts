@@ -23,6 +23,7 @@ import { readFileSync, readdirSync, statSync, existsSync } from "fs";
 import { join, resolve } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
+import { PROJECTS_DIR, resolveProjectPath } from "./project-resolver.js";
 import { randomUUID } from "crypto";
 import { z } from "zod";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -91,7 +92,7 @@ const jobs = new Map<string, Job>();
 const processes = new Map<string, ChildProcess>();
 const timeouts = new Map<string, ReturnType<typeof setTimeout>>();
 const JOB_TTL_MS = 24 * 60 * 60 * 1000; // purge jobs after 24h
-const MAX_CONCURRENT_JOBS = 3; // F10: cap simultaneous Claude Code subprocesses
+const MAX_CONCURRENT_JOBS = 5; // F10: cap simultaneous Claude Code subprocesses
 const OUTPUT_CAP = 512 * 1024; // F5: 512KB in-memory output ceiling
 const TASK_TIMEOUT_MS = 30 * 60 * 1000; // F21: 30-minute hard timeout per task
 
@@ -110,39 +111,6 @@ function purgeOldJobs(): void {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-const PROJECTS_DIR = join(homedir(), "Projects");
-
-function resolveProjectPath(project: string): string {
-  // Prevent directory traversal
-  const safeName = project.replace(/[^a-zA-Z0-9_\-. ]/g, "");
-  if (safeName !== project) {
-    throw new Error(
-      `Invalid project name: "${project}". Use alphanumeric characters, hyphens, underscores, or spaces.`
-    );
-  }
-
-  const check = (p: string): string | null => {
-    if (!p.startsWith(PROJECTS_DIR)) return null;
-    return existsSync(p) ? p : null;
-  };
-
-  // 1. Flat: ~/Projects/{project}
-  const flat = resolve(PROJECTS_DIR, project);
-  if (check(flat)) return flat;
-
-  // 2. One level deep: ~/Projects/*/{project}
-  const entries = readdirSync(PROJECTS_DIR, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const candidate = resolve(PROJECTS_DIR, entry.name, project);
-    if (check(candidate)) return candidate;
-  }
-
-  throw new Error(
-    `Project not found: ${project} (checked ~/Projects/${project} and one level deep)`
-  );
-}
 
 function formatJob(job: Job): string {
   const lines = [
@@ -176,7 +144,7 @@ server.registerTool(
 Poll claude_get_task_status with the returned job_id to see output as it streams in. The task completes when status is "completed" or "failed".
 
 Args:
-  - project (string): Project folder name inside ~/Projects/ (e.g. "forkcast", "academic-architect")
+  - project (string): Project path inside ~/Projects/. Accepts plain names ("forkcast") or nested paths up to 3 segments ("Apps/lookahead", "Clients/acme/site"). Each segment may contain alphanumeric characters, hyphens, underscores, dots, or spaces.
   - task (string): The instruction to pass to Claude Code via "claude -p". Be specific.
   - context_file (string, optional): Absolute path to a handoff file. Its content is prepended to the task.
 
@@ -186,8 +154,9 @@ Returns:
   - message: Confirmation with project path and PID
 
 Examples:
-  - Run a task: project="forkcast", task="Add the missing bankroll_transactions indexes from the schema handoff"
-  - With context: project="forkcast", task="Implement phase 2", context_file="/Users/juliantang/Projects/forkcast/cowork/handoffs/phase2-handoff-2026-05-12.md"
+  - Top-level project: project="forkcast", task="Add the missing bankroll_transactions indexes"
+  - Nested project:    project="Apps/lookahead", task="Implement the dashboard page"
+  - With context:      project="forkcast", task="Implement phase 2", context_file="/Users/juliantang/Projects/forkcast/cowork/handoffs/phase2-handoff-2026-05-12.md"
 
 Limits:
   - Tasks are killed after 30 minutes with status "failed"
@@ -195,7 +164,7 @@ Limits:
 
 Error cases:
   - "Project not found" if ~/Projects/{project} doesn't exist
-  - "Invalid project name" if name contains unsafe characters
+  - "Invalid project name" if name contains unsafe characters or more than 3 segments
   - "Failed to start Claude Code process" if spawn options are invalid (missing binary surfaces as a failed job via the process error event)
   - "concurrent job limit reached" if 3 tasks are already running`,
     inputSchema: z
@@ -203,7 +172,7 @@ Error cases:
         project: z
           .string()
           .min(1, "Project name is required")
-          .describe("Folder name inside ~/Projects/"),
+          .describe('Project path inside ~/Projects/ — plain name ("forkcast") or nested path up to 3 segments ("Apps/lookahead", "Clients/acme/site")'),
         task: z
           .string()
           .min(1, "Task description is required")
@@ -217,6 +186,10 @@ Error cases:
           .uuid()
           .optional()
           .describe("UUID from memory.tasks — used to link dispatcher_jobs rows"),
+        skill_name: z
+          .string()
+          .optional()
+          .describe("Skill name that ran this job (e.g. 'tdd-guide', 'agent-shield') — stored in dispatcher_jobs for dashboard visibility"),
       })
       .strict(),
     annotations: {
@@ -226,7 +199,7 @@ Error cases:
       openWorldHint: true,
     },
   },
-  async ({ project, task, context_file, task_id }) => {
+  async ({ project, task, context_file, task_id, skill_name }) => {
     purgeOldJobs();
 
     // F10: reject if concurrent running job limit is reached
@@ -302,6 +275,7 @@ Error cases:
         job_id: jobId,
         task_id,
         project,
+        skill_name: skill_name ?? null,
         status: "running",
         started_at: job.startedAt,
       }).then(({ error }) => {
@@ -323,7 +297,7 @@ Error cases:
       child = spawn(
         "claude",
         [
-          "--permission-mode", "dontAsk",
+          "--dangerously-skip-permissions",
           "--add-dir", PROJECTS_DIR,
           "--print", "--verbose", "--output-format", "stream-json",
           fullPrompt,
@@ -331,6 +305,10 @@ Error cases:
         {
           cwd: projectPath,
           env: { ...process.env },
+          // detached: true creates a new process group (PGID == child.pid).
+          // This lets process.kill(-pid, 'SIGKILL') kill Claude Code and all
+          // grandchild processes it spawns, preventing orphans on timeout/completion.
+          detached: true,
           stdio: ["ignore", "pipe", "pipe"],
         }
       );
@@ -359,7 +337,10 @@ Error cases:
     const timeoutHandle = setTimeout(() => {
       const proc = processes.get(jobId);
       if (proc) {
-        proc.kill("SIGKILL");
+        // Kill the entire process group so grandchildren spawned by Claude Code
+        // don't survive as orphans. Wrapped in try/catch: ESRCH fires if the
+        // process already exited between the check and the kill call.
+        try { if (proc.pid) process.kill(-proc.pid, "SIGKILL"); } catch {}
         job.status = "failed";
         job.output += "\n[Task timed out after 30 minutes]";
         job.completedAt = new Date().toISOString();
@@ -402,8 +383,44 @@ Error cases:
                 }
               }
             }
+          } else if (event.type === "result") {
+            // stream-json emits a "result" event when the Claude session ends,
+            // before the process exits. Finalize here so the DB is updated
+            // immediately rather than waiting for the 'close' event.
+            const ev = event as { subtype?: string; is_error?: boolean; result?: string };
+            const now = new Date().toISOString();
+            const succeeded = ev.subtype === "success" && !ev.is_error;
+            job.status = succeeded ? "completed" : "failed";
+            job.exitCode = succeeded ? 0 : 1;
+            job.completedAt = now;
+            if (typeof ev.result === "string" && ev.result) {
+              if (job.output.length < OUTPUT_CAP) {
+                job.output += ev.result;
+              } else if (!job.output.endsWith("[output truncated at 512KB]")) {
+                job.output += "\n[output truncated at 512KB]";
+              }
+            }
+            if (supabase && job.taskId) {
+              supabase.schema("memory").from("dispatcher_jobs").update({
+                status: job.status,
+                output: job.output.slice(0, 10000),
+                exit_code: job.exitCode,
+                completed_at: now,
+              }).eq("job_id", jobId).then(({ error }) => {
+                if (error) console.error("[bridge] dispatcher_jobs update (result event) error:", error.message);
+              });
+            }
+            // Clear the 30-min timeout — the session is done.
+            const th = timeouts.get(jobId);
+            if (th) { clearTimeout(th); timeouts.delete(jobId); }
+            // Arm a 5-second grace timer to SIGKILL the process group.
+            // Claude Code may still be flushing stderr / closing files after emitting
+            // the result event; the grace window lets it exit cleanly first.
+            setTimeout(() => {
+              try { if (child.pid) process.kill(-child.pid, "SIGKILL"); } catch {}
+            }, 5000);
           }
-          // Ignore other event types (result, tool_use, tool_result, system, etc.)
+          // Ignore other event types (tool_use, tool_result, system, etc.)
         } catch {
           // Not JSON — append raw so nothing is silently lost
           // F5: cap in-memory output at 512KB
@@ -445,6 +462,13 @@ Error cases:
       timeouts.delete(jobId);
       if (job.status === "cancelled") {
         processes.delete(jobId); // F8 + cleanup: ensure map is cleared even on cancel
+        return;
+      }
+      // Guard: the result-event handler may have already finalized status.
+      // Only update if we're still "running" (the fallback path for sessions that
+      // never emit a result event, e.g. crashes, SIGKILL from the 30-min timeout).
+      if (job.status !== "running") {
+        processes.delete(jobId);
         return;
       }
       job.status = code === 0 ? "completed" : "failed";
@@ -765,11 +789,12 @@ server.registerTool(
   "claude_list_projects",
   {
     title: "List Projects",
-    description: `List all project directories in ~/Projects/.
+    description: `List all project directories in ~/Projects/, including one level of nesting.
 
-Use this to discover valid project names before calling claude_run_task.
+Use this to discover valid project names (and nested paths) before calling claude_run_task.
+Nested entries appear as "ParentDir/SubDir" and can be passed directly to claude_run_task.
 
-Returns a list of directory names.`,
+Returns a combined list of top-level directories and their immediate subdirectories.`,
     inputSchema: z.object({}).strict(),
     annotations: {
       readOnlyHint: true,
@@ -779,16 +804,11 @@ Returns a list of directory names.`,
     },
   },
   async () => {
-    let entries: string[];
+    let topLevel: string[];
     try {
-      entries = readdirSync(PROJECTS_DIR)
-        .filter((name) => {
-          try {
-            return statSync(join(PROJECTS_DIR, name)).isDirectory();
-          } catch {
-            return false;
-          }
-        })
+      topLevel = readdirSync(PROJECTS_DIR, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name)
         .sort();
     } catch {
       return {
@@ -802,17 +822,32 @@ Returns a list of directory names.`,
       };
     }
 
+    // Also enumerate one level of nesting so callers can see nested project paths
+    // (e.g. "Apps/lookahead") that can be passed directly to claude_run_task.
+    const allPaths: string[] = [...topLevel];
+    for (const dir of topLevel) {
+      try {
+        const nested = readdirSync(join(PROJECTS_DIR, dir), { withFileTypes: true })
+          .filter((e) => e.isDirectory())
+          .map((e) => `${dir}/${e.name}`)
+          .sort();
+        allPaths.push(...nested);
+      } catch {
+        // unreadable subdirectory — skip silently
+      }
+    }
+
     const result = {
       projects_dir: PROJECTS_DIR,
-      count: entries.length,
-      projects: entries,
+      count: allPaths.length,
+      projects: allPaths,
     };
 
     return {
       content: [
         {
           type: "text",
-          text: `## Projects in ~/Projects/ (${entries.length})\n\n${entries.map((e) => `- ${e}`).join("\n")}`,
+          text: `## Projects in ~/Projects/ (${allPaths.length})\n\n${allPaths.map((e) => `- ${e}`).join("\n")}`,
         },
       ],
       structuredContent: result,
